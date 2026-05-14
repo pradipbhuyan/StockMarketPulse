@@ -20,6 +20,7 @@ Features:
 - Top 10 Indian stocks for the day with target, stop-loss, confidence and probability estimate
 - PDF and CSV export
 - Manual email delivery with attachments
+- Persistent SQLite-backed paper trading: manually buy 1 share of top 5 picks and manually exit positions
 
 Required secrets or environment variables:
 OPENAI_API_KEY
@@ -40,7 +41,7 @@ DEFAULT_UNIVERSE=NIFTY100
 OPENAI_USE_LLM=true
 
 Install:
-pip install streamlit openai yfinance pandas numpy plotly reportlab python-dateutil
+pip install streamlit openai yfinance pandas numpy plotly reportlab python-dateutil truststore
 
 Run:
 streamlit run indian_stock_pulse_ai.py
@@ -53,10 +54,12 @@ import math
 import os
 import re
 import smtplib
+import sqlite3
 import ssl
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -273,6 +276,225 @@ def load_json(path: Path) -> Any:
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8"))
     return None
+
+# -----------------------------------------------------------------------------
+# Persistent paper-trading ledger
+# -----------------------------------------------------------------------------
+DB_PATH = Path("stockpulse_paper_trades.sqlite3")
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def today_ist_str() -> str:
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+def now_ist_iso() -> str:
+    return datetime.now(IST).isoformat(timespec="seconds")
+
+
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_paper_trade_db() -> None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            yf_symbol TEXT,
+            company TEXT,
+            sector TEXT,
+            rank INTEGER,
+            score REAL,
+            probability_pct REAL,
+            target_price REAL,
+            stop_loss REAL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            entry_time TEXT,
+            entry_price REAL,
+            exit_time TEXT,
+            exit_price REAL,
+            pnl REAL,
+            pnl_pct REAL,
+            status TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(trade_date, symbol)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_latest_price(symbol: str) -> float | None:
+    """Return latest publicly available NSE price from yfinance; may be delayed."""
+    try:
+        ticker = yf.Ticker(ns_symbol(symbol))
+        hist = ticker.history(period="1d", interval="1m", auto_adjust=False)
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            close = hist["Close"].dropna()
+            if not close.empty:
+                return float(close.iloc[-1])
+        fast_info = getattr(ticker, "fast_info", None)
+        if fast_info:
+            last_price = fast_info.get("last_price") if hasattr(fast_info, "get") else None
+            if last_price:
+                return float(last_price)
+    except Exception:
+        return None
+    return None
+
+
+def create_paper_trades_for_today(top_picks_df: pd.DataFrame | None, max_positions: int = 5) -> tuple[int, list[str]]:
+    """Create manual paper BUY entries for 1 share each of today's top N stocks."""
+    if top_picks_df is None or top_picks_df.empty:
+        return 0, ["No top picks available. Run the daily scan first."]
+
+    trade_date = today_ist_str()
+    now_iso = now_ist_iso()
+    created = 0
+    errors: list[str] = []
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    picks = top_picks_df.head(max_positions).copy()
+
+    for idx, row in picks.iterrows():
+        symbol = safe_symbol(str(row.get("symbol", "")))
+        if not symbol:
+            continue
+        entry_price = get_latest_price(symbol)
+        if entry_price is None:
+            errors.append(f"Could not fetch latest entry price for {symbol}.")
+            continue
+        try:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO paper_trades (
+                    trade_date, symbol, yf_symbol, company, sector, rank, score, probability_pct,
+                    target_price, stop_loss, quantity, entry_time, entry_price, status, notes,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_date,
+                    symbol,
+                    ns_symbol(symbol),
+                    textify(row.get("company", "")),
+                    textify(row.get("sector", "")),
+                    int(row.get("rank", idx + 1)),
+                    float(row.get("score", 0) or 0),
+                    float(row.get("probability_pct", 0) or 0),
+                    float(row.get("target_price", 0) or 0),
+                    float(row.get("stop_loss", 0) or 0),
+                    1,
+                    now_iso,
+                    float(entry_price),
+                    "OPEN",
+                    "Manual paper entry: 1 share from top-5 daily picks.",
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            if cur.rowcount > 0:
+                created += 1
+            else:
+                errors.append(f"{symbol} already has a paper trade for {trade_date}.")
+        except Exception as e:
+            errors.append(f"{symbol}: {e}")
+
+    conn.commit()
+    conn.close()
+    return created, errors
+
+
+def close_today_paper_trades() -> tuple[int, list[str]]:
+    """Manually close today's OPEN paper trades using latest publicly available prices."""
+    trade_date = today_ist_str()
+    now_iso = now_ist_iso()
+    closed = 0
+    errors: list[str] = []
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT * FROM paper_trades WHERE trade_date = ? AND status = 'OPEN' ORDER BY rank ASC",
+        (trade_date,),
+    ).fetchall()
+
+    for row in rows:
+        symbol = row["symbol"]
+        exit_price = get_latest_price(symbol)
+        if exit_price is None:
+            errors.append(f"Could not fetch latest exit price for {symbol}.")
+            continue
+        entry_price = float(row["entry_price"] or 0)
+        qty = int(row["quantity"] or 1)
+        pnl = round((float(exit_price) - entry_price) * qty, 2)
+        pnl_pct = round(((float(exit_price) - entry_price) / entry_price) * 100, 2) if entry_price else 0.0
+        cur.execute(
+            """
+            UPDATE paper_trades
+            SET exit_time = ?, exit_price = ?, pnl = ?, pnl_pct = ?, status = 'CLOSED', updated_at = ?
+            WHERE id = ?
+            """,
+            (now_iso, float(exit_price), pnl, pnl_pct, now_iso, row["id"]),
+        )
+        closed += 1
+
+    conn.commit()
+    conn.close()
+    return closed, errors
+
+
+def load_paper_trades(trade_date: str | None = None) -> pd.DataFrame:
+    conn = get_db_connection()
+    if trade_date:
+        df = pd.read_sql_query(
+            "SELECT * FROM paper_trades WHERE trade_date = ? ORDER BY rank ASC, symbol ASC",
+            conn,
+            params=(trade_date,),
+        )
+    else:
+        df = pd.read_sql_query(
+            "SELECT * FROM paper_trades ORDER BY trade_date DESC, rank ASC, symbol ASC",
+            conn,
+        )
+    conn.close()
+    return df
+
+
+def load_paper_trade_summary() -> pd.DataFrame:
+    conn = get_db_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT
+            trade_date,
+            COUNT(*) AS trades,
+            SUM(CASE WHEN status = 'CLOSED' THEN pnl ELSE 0 END) AS realized_pnl,
+            AVG(CASE WHEN status = 'CLOSED' THEN pnl_pct ELSE NULL END) AS avg_pnl_pct,
+            SUM(CASE WHEN status = 'CLOSED' AND pnl > 0 THEN 1 ELSE 0 END) AS winners,
+            SUM(CASE WHEN status = 'CLOSED' AND pnl < 0 THEN 1 ELSE 0 END) AS losers,
+            SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open_positions
+        FROM paper_trades
+        GROUP BY trade_date
+        ORDER BY trade_date DESC
+        """,
+        conn,
+    )
+    conn.close()
+    return df
+
+
+init_paper_trade_db()
 
 # -----------------------------------------------------------------------------
 # Indicators
@@ -780,7 +1002,7 @@ if df is not None and not df.empty:
         },
     )
 
-    tabs = st.tabs(["📊 Top Stock Detail", "📈 Chart", "🧪 Full Data", "📄 Downloads & Email"])
+    tabs = st.tabs(["📊 Top Stock Detail", "📈 Chart", "🧪 Paper Trading", "🧪 Full Data", "📄 Downloads & Email"])
     with tabs[0]:
         notes = {n.get("symbol"): n for n in (llm.get("stock_notes", []) or []) if isinstance(n, dict)}
         for _, row in top10.iterrows():
@@ -811,19 +1033,110 @@ if df is not None and not df.empty:
             st.plotly_chart(fig, use_container_width=True)
 
     with tabs[2]:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown("## 🧪 Manual Daily Paper Trading")
+        st.caption(
+            "This simulates buying 1 share each of the top 5 ranked stocks and exiting later. "
+            "Prices come from the latest publicly available yfinance feed and may be delayed. "
+            "Use this only as a paper-trading ledger, not as execution advice."
+        )
+        st.markdown(
+            f'<div class="warn-card"><b>Suggested timing:</b> Click <b>Create 9:30 AM Paper Entries</b> around market open, '
+            f'then click <b>Exit Today\'s Paper Trades</b> around 3:00 PM IST. Current IST date: <b>{today_ist_str()}</b>.</div>',
+            unsafe_allow_html=True,
+        )
+
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        with pc1:
+            if st.button("Create 9:30 AM Paper Entries", use_container_width=True):
+                created, errors = create_paper_trades_for_today(top10, max_positions=5)
+                if created:
+                    st.success(f"Created {created} paper trade(s).")
+                if errors:
+                    for err in errors:
+                        st.warning(err)
+        with pc2:
+            if st.button("Exit Today's Paper Trades", use_container_width=True):
+                closed, errors = close_today_paper_trades()
+                if closed:
+                    st.success(f"Closed {closed} paper trade(s).")
+                else:
+                    st.info("No open paper trades found for today.")
+                if errors:
+                    for err in errors:
+                        st.warning(err)
+        today_trades = load_paper_trades(today_ist_str())
+        all_summary = load_paper_trade_summary()
+        realized_today = float(today_trades["pnl"].fillna(0).sum()) if not today_trades.empty and "pnl" in today_trades else 0.0
+        open_count = int((today_trades["status"] == "OPEN").sum()) if not today_trades.empty and "status" in today_trades else 0
+        cumulative_pnl = float(all_summary["realized_pnl"].fillna(0).sum()) if not all_summary.empty and "realized_pnl" in all_summary else 0.0
+        with pc3:
+            st.metric("Today's Realized P&L", f"₹{realized_today:,.2f}")
+        with pc4:
+            st.metric("Open Positions", open_count, help="Open paper trades for current IST date")
+        st.metric("Cumulative Realized P&L", f"₹{cumulative_pnl:,.2f}")
+
+        st.markdown("### Today's Paper Trades")
+        if today_trades.empty:
+            st.info("No paper trades saved for today yet.")
+        else:
+            st.dataframe(
+                today_trades,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                    "exit_price": st.column_config.NumberColumn("Exit", format="₹%.2f"),
+                    "pnl": st.column_config.NumberColumn("P&L", format="₹%.2f"),
+                    "pnl_pct": st.column_config.NumberColumn("P&L %", format="%.2f%%"),
+                    "probability_pct": st.column_config.NumberColumn("Probability", format="%.1f%%"),
+                    "score": st.column_config.NumberColumn("Score", format="%.1f"),
+                },
+            )
+            st.download_button(
+                "⬇️ Download Today's Paper Trades CSV",
+                data=today_trades.to_csv(index=False).encode("utf-8"),
+                file_name=f"paper_trades_{today_ist_str()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        st.markdown("### Daily Paper-Trade Summary")
+        if all_summary.empty:
+            st.info("No historical paper-trading summary yet.")
+        else:
+            st.dataframe(
+                all_summary,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "realized_pnl": st.column_config.NumberColumn("Realized P&L", format="₹%.2f"),
+                    "avg_pnl_pct": st.column_config.NumberColumn("Avg P&L %", format="%.2f%%"),
+                },
+            )
+            st.download_button(
+                "⬇️ Download Full Paper Ledger CSV",
+                data=load_paper_trades().to_csv(index=False).encode("utf-8"),
+                file_name="stockpulse_paper_trade_ledger.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     with tabs[3]:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with tabs[4]:
         csv_path = rpath("csv", "_top_candidates")
         pdf_path = rpath("pdf", "_report")
         json_path = rpath("json", "_analysis")
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         if csv_path.exists():
             c1.download_button("⬇️ Download CSV", csv_path.read_bytes(), file_name=csv_path.name, mime="text/csv", use_container_width=True)
         if pdf_path.exists():
             c2.download_button("⬇️ Download PDF", pdf_path.read_bytes(), file_name=pdf_path.name, mime="application/pdf", use_container_width=True)
         if json_path.exists():
             c3.download_button("⬇️ Download JSON", json_path.read_bytes(), file_name=json_path.name, mime="application/json", use_container_width=True)
+        if DB_PATH.exists():
+            c4.download_button("⬇️ Download Paper DB", DB_PATH.read_bytes(), file_name=DB_PATH.name, mime="application/octet-stream", use_container_width=True)
 
         st.markdown("### 📧 Email report")
         if not email_ok:
